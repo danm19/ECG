@@ -1,72 +1,135 @@
-#include <stdio.h>
-#include <stdlib.h>
+#include <SPI.h>
+#include "SD.h"
 
-#define M            5
-#define N           30
-#define WINSIZE    250
 
-#define MAXSIZE 6
-#define next(elem) ((elem+1)%MAXSIZE)
-#define HP_CONSTANT   ((float) 1 / (float) M)
-#define MAX_BPM     100
+#define SCK  18
+#define MISO  19
+#define MOSI  23
+#define CS  5
+
+/* Pam-Tompkins algorithm variables 
+ * M - Define the size for the Highpass filter 
+ * N - Define the size for the Lowpass filter
+ * WINSIZE - Defines the windowsize to set the sensitivty of the QRS-detection. 
+ * OBS: WINSIZE can be set empirically
+*/
+#define M            5    
+#define N           30 
+#define WINSIZE    150    
+#define N_SAMPLES  300
+#define MAXSIZE      6
+#define next(elem)   ((elem+1)%MAXSIZE)
+#define HP_CONSTANT  ((float) 1 / (float) M)
+#define MAX_BPM    100
+#define MAX_BPM_SIZE     6
 
 // resolution of RNG
 #define RAND_RES 100000000
 
+
+
 const int ECG_PIN =  34;       // the number of the ECG pin (analog)
 const int LEADS_OFF_PLUS_PIN = 35;
 const int LEADS_OFF_MINUS_PIN = 32;
+const int SD_CS = 0;
 
-// Declaration of the variables about ECG data collection.
-// A buffer circular will be used to save data from ECG signal to High-Pass and Low-Pass filter. 
-float ecg_raw_data[M + 1] = {0}; // Size buffer equal a M+1
-int ecg_init_ptr = 0; // Initial index of the circular buffer.
-int ecg_final_ptr = 0; // Final index of the circular buffer.
+unsigned long bpm_buff[MAX_BPM_SIZE] = {0};
+int bpm_wd_ptr = 0;
+int bpm_rd_ptr = 0;
+float bpm = 0;
 
-// Declaration of the variables about High-Pass Filter. 
-float hp_buff[N + 1] = {0};
+float ecg_raw_data[MAXSIZE] = {0};
+int ecg_wr_ptr = 0 ;
+int ecg_rd_ptr = 0 ;
+
+float hp_data[N+1] = {0};
+int hp_wr_ptr = 0 ;
+int hp_rd_ptr = 0 ;
+
 float hp_sum = 0;
+float lp_sum = 0;
+float next_ptr = 0;
+
 float hp_data1 = 0;
 float hp_data2 = 0;
-int hp_buff_WR_idx = 0;
-int hp_buff_RD_idx = 0;
 
-// Declaration of the variables about Low-Pass Filter. 
-float lp_sum = 0;
+float treshold=0 ;
+boolean triggered=false ;
+int trig_time = 0 ;
+float win_max = 0 ;
+int win_idx = 0 ;
 
-boolean QRS_detected = false;
+int cprTimeRead1 = 0 ;
+int cprTimeRead2 = 0 ;
+int timeCPR = 0 ;
+float CPRSUM;
+
+unsigned long previousMicros  = 0;        // will store last time LED was updated
+unsigned long foundTimeMicros = 0;        // time at which last QRS was found
+unsigned long old_foundTimeMicros = 0;        // time at which QRS before last was found
+unsigned long currentMicros   = 0;        // current time
+const long PERIOD = 1000000 / WINSIZE;
+
 int n_interat = 0;
-int aux = 0;
 
-// working variables for adaptive thresholding
-float treshold = 0;
-float win_max = 0;
-float next_eval_pt = 0;
-int trig_time = 0;
-int win_idx = 0;
-boolean triggered = false;
+const char* Filename = "Output.csv";
+
+void writeFile(fs::FS &fs, const char * path, const char * message){
+    Serial.printf("Writing file: %s\n", path);
+
+    File file = fs.open(path, FILE_WRITE);
+    if(!file){
+        Serial.println("Failed to open file for writing");
+        return;
+    }
+    if(file.print(message)){
+        Serial.println("File written");
+    } else {
+        Serial.println("Write failed");
+    }
+    file.close();
+}
+
+void appendFile(fs::FS &fs, const char * path, const char * message){
+    Serial.printf("Appending to file: %s\n", path);
+
+    File file = fs.open(path, FILE_APPEND);
+    if(!file){
+        Serial.println("Failed to open file for appending");
+        return;
+    }
+    if(file.print(message)){
+        Serial.println("Message appended");
+    } else {
+        Serial.println("Append failed");
+    }
+    file.close();
+}
 
 boolean detect(float ecg_data)
 {
-  ecg_raw_data[ecg_init_ptr] = ecg_data;
-  next(ecg_init_ptr);
-
+  int aux = 0;
+  //Put a new data in the circular buffer before the bandpass filter. 
+  ecg_raw_data[ecg_wr_ptr] = ecg_data;
+  ecg_wr_ptr = (ecg_wr_ptr+1)%(M+1);
+  
+  // Put a new data into the circular buffer of the High Pass filter. 
+  // This step checks if the circular buffer is available for a new data. 
   if(n_interat < M)
   {
-    hp_sum += ecg_raw_data[ecg_final_ptr];
-    hp_buff[hp_buff_WR_idx] = 0; // ALTERAR
+    hp_sum += ecg_raw_data[ecg_rd_ptr];
+    hp_data[hp_wr_ptr] = 0; // ALTERAR
   }
-
   else
   {
-    hp_sum += ecg_raw_data[ecg_final_ptr];   
-    aux = ecg_final_ptr - M;
+    hp_sum += ecg_raw_data[ecg_rd_ptr];   
+    aux = ecg_rd_ptr - M;
     
     if(aux < 0)
       aux += (M + 1);
     
     hp_sum -= ecg_raw_data[aux];
-    aux = (ecg_final_ptr - ((M+1)/2));
+    aux = (ecg_rd_ptr - ((M+1)/2));
     
     if(aux < 0)
       aux += M + 1;
@@ -74,53 +137,45 @@ boolean detect(float ecg_data)
     hp_data1 = ecg_raw_data[aux];   
     hp_data2 = HP_CONSTANT * hp_sum;
     
-    hp_buff[hp_buff_WR_idx] = hp_data1 - hp_data2;
+    hp_data[hp_wr_ptr] = hp_data1 - hp_data2;
+      
   }
-    if((ecg_final_ptr+1) < M+1)
-        ecg_final_ptr = ecg_final_ptr;
-    else
-        ecg_final_ptr = 0;
+  ecg_rd_ptr = (ecg_rd_ptr+1)%(M+1);
+  hp_wr_ptr = (hp_wr_ptr+1)%(N+1);
 
-    if((ecg_final_ptr+1) < M+1)
-        ecg_final_ptr = ecg_final_ptr;
-    else
-        ecg_final_ptr = 0;
-
- /* Low pass filtering */
-  
+ //Low pass filtering 
   // shift in new sample from high pass filter
-  lp_sum += hp_buff[ecg_final_ptr] * hp_buff[ecg_final_ptr];
+  lp_sum += hp_data[hp_rd_ptr] * hp_data[hp_rd_ptr];
   
   if(n_interat < N){
     // first fill buffer with enough points for LP filter
-    next_eval_pt = 0;
-    
+    next_ptr = 0;
   }
   else{
     // shift out oldest data point
-    aux = hp_buff_RD_idx - N;
-    if(aux < 0) aux += (N+1);
+    aux = hp_rd_ptr - N;
+    if(aux < 0) 
+      aux += (N+1);
     
-    lp_sum -= hp_buff[aux] * hp_buff[aux];
-    
-    next_eval_pt = lp_sum;
+    lp_sum -= hp_data[aux] * hp_data[aux];
+
+    next_ptr = lp_sum;
   }
   
   // done reading HP buffer, increment position
-  hp_buff_RD_idx++;
-  hp_buff_RD_idx %= (N+1);
-  
+  hp_rd_ptr = (hp_rd_ptr+1)%(N+1);
 
-  /* Adapative thresholding beat detection */
+
+  /// Adapative thresholding beat detection
   // set initial threshold        
   if(n_interat < WINSIZE) {
-    if(next_eval_pt > treshold) {
-      treshold = next_eval_pt;
+    if(next_ptr > treshold) {
+      treshold = next_ptr;
     }
-
-                // only increment n_interat iff it is less than WINSIZE
-                // if it is bigger, then the counter serves no further purpose
-                n_interat++;
+    
+    // only increment n_interat iff it is less than WINSIZE
+    // if it is bigger, then the counter serves no further purpose
+    n_interat++;
   }
   
   // check if detection hold off period has passed
@@ -134,10 +189,11 @@ boolean detect(float ecg_data)
   }
   
   // find if we have a new max
-  if(next_eval_pt > win_max) win_max = next_eval_pt;
+  if(next_ptr > win_max) 
+    win_max = next_ptr;
   
   // find if we are above adaptive threshold
-  if(next_eval_pt > treshold && !triggered) {
+  if(next_ptr > treshold && !triggered) {
     triggered = true;
 
     return true;
@@ -159,7 +215,7 @@ boolean detect(float ecg_data)
     
                 // compute new threshold
     treshold = alpha * gamma * win_max + (1 - alpha) * treshold;
-    
+    //Serial.println(treshold); 
     // reset current window index
     win_idx = 0;
     win_max = -10000000;
@@ -167,28 +223,62 @@ boolean detect(float ecg_data)
       
         // return false if we didn't detect a new QRS
   return false;
-    
+
 }
-  
 
 void setup() {
   // set the digital pin as output:
+  int i =6;
+  Serial.begin(115200);
+  
   pinMode(ECG_PIN, INPUT);
-
-  // leads for electrodes off detection
   pinMode(LEADS_OFF_PLUS_PIN, INPUT); // Setup for leads off detection LO +
   pinMode(LEADS_OFF_MINUS_PIN, INPUT); // Setup for leads off detection LO -
+    
+  SPIClass spi = SPIClass(VSPI);
+  spi.begin(SCK, MISO, MOSI, CS);
 
-  Serial.begin(115200);
-
+  if (!SD.begin(CS)){
+    Serial.println("Card Mount Failed");
+    return;
+  }
+  else {  
+    Serial.println("Card Mount Success");
+  }  
+  if(SD.exists(Filename))
+    SD.remove(Filename);
+    
+  writeFile(SD,Filename,"Counter,Time,QRS");
 }
+bool Plotting = true;
+int i = 0;
 
 void loop() {
-  int next_ecg_pt = analogRead(ECG_PIN);
-  
-  delay(50);
-  // give next data point to algorithm
-  QRS_detected = detect(next_ecg_pt);
-  
+  delay(2);
+  String aux = "";
+  currentMicros = micros();
+  previousMicros = currentMicros;
 
-}
+  int next_ecg_pt = analogRead(ECG_PIN);
+  boolean QRS_detected = false;
+  
+  //give next data point to algorithm
+  QRS_detected = detect(next_ecg_pt);
+
+  if(i < N_SAMPLES){
+    aux += String(i);
+    aux += ",";
+    aux += String(currentMicros);
+    aux += ",";
+    aux += String(QRS_detected);
+    aux += "\r\n";
+    appendFile(SD, "/teste.csv", aux.c_str());
+    delay(200);
+  }
+  i++;
+
+  if(QRS_detected == true)
+    foundTimeMicros = micros(); 
+
+}    
+  
