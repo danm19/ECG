@@ -1,6 +1,6 @@
 #include <SPI.h>
 #include "SD.h"
-#include "ResponsiveAnalogRead.h"
+#include <SavLayFilter.h>
 
 #define SCK  18
 #define MISO  19
@@ -16,7 +16,7 @@
 #define M            5    
 #define N           30 
 #define WINSIZE    250    
-#define N_SAMPLES  1000
+#define N_SAMPLES  1500
 #define MAXSIZE      6
 #define next(elem)   ((elem+1)%MAXSIZE)
 #define HP_CONSTANT  ((float) 1 / (float) M)
@@ -78,6 +78,10 @@ int interval = 0;
 
 const char* Filename = "/Output.csv";
 
+double outputValue;
+           //Computes the first derivative
+
+
 void writeFile(fs::FS &fs, const char * path, const char * message){
     //Serial.printf("Writing file: %s\n", path);
 
@@ -99,25 +103,26 @@ void appendFile(fs::FS &fs, const char * path, const char * message){
 
     File file = fs.open(path, FILE_APPEND);
     if(!file){
-       Serial.println("Failed to open file for appending");
+       //Serial.println("Failed to open file for appending");
        return;
     }
     if(file.print(message)){
-        Serial.println("Message appended");
+        //Serial.println("Message appended");
     } else {
-        Serial.println("Append failed");
+        //Serial.println("Append failed");
     }
     file.close();
 }
 
+double next_ecg_pt =0;
+double test=0;
+SavLayFilter firstDerivative (&test, 1, 7);
 boolean detect(float ecg_data){
-  
+ 
   int aux = 0;
   //Put a new data in the circular buffer before the bandpass filter. 
   ecg_raw_data[ecg_wr_ptr] = ecg_data;
   ecg_wr_ptr = (ecg_wr_ptr+1)%(M+1);
-
-  //Serial.println(ecg_raw_data[ecg_rd_ptr]);
   
   // Put a new data into the circular buffer of the High Pass filter. 
   // This step checks if the circular buffer is available for a new data. 
@@ -168,9 +173,13 @@ boolean detect(float ecg_data){
     
   } 
   // done reading HP buffer, increment position
-  hp_rd_ptr = (hp_rd_ptr+1)%(N+1);
-  //Serial.println(hp_data[hp_rd_ptr]);
+   
   
+  hp_rd_ptr = (hp_rd_ptr+1)%(N+1);
+  test = hp_data[hp_rd_ptr];
+  //Serial.println(hp_data[hp_rd_ptr]);
+  //Serial.print(",");
+  Serial.println(2*firstDerivative.Compute());
   /// Adapative thresholding beat detection
   // set initial threshold        
   if(n_interat < WINSIZE) {
@@ -261,8 +270,11 @@ void loop() {
   currentMicros = micros();
   previousMicros = currentMicros;
 
-  int next_ecg_pt = analogRead(ECG_PIN);
-  boolean QRS_detected = false;
+  next_ecg_pt = analogRead(ECG_PIN);
+                               //Raw Value [Blue line]
+
+
+boolean QRS_detected = false;
 
    if (currentMicros - previousMicros >= PERIOD) {
       // save the last time you blinked the LED
@@ -271,7 +283,7 @@ void loop() {
 
   //give next data point to algorithm
   QRS_detected = detect(next_ecg_pt);
-  Serial.println(QRS_detected);
+  //Serial.println(QRS_detected);
   
    if(i < N_SAMPLES){
     aux += String(i);
